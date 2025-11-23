@@ -1,0 +1,38 @@
+name: Parking
+description: "A new Flutter project."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.8.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  firebase_core: ^4.1.1
+  cloud_firestore: ^6.0.2
+  intl: ^0.20.2
+  firebase_auth: ^6.1.0
+  google_sign_in: ^6.1.5
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  # ↴ Plugin tạo icon app
+  flutter_launcher_icons: ^0.13.1
+
+# Cấu hình flutter_launcher_icons (top-level, cùng cấp với `flutter:`)
+flutter_icons:
+  android: true
+  ios: false
+  image_path: assets/app_icon.png   # Ảnh nguồn 1024x1024 (PNG, nền vuông)
+  min_sdk_android: 21
+  # Nếu bạn có icon tách lớp cho Android adaptive icon thì dùng 2 dòng dưới thay cho image_path:
+  # adaptive_icon_foreground: assets/app_icon_foreground.png
+  # adaptive_icon_background: "#FFFFFF"   # hoặc file PNG nền
+
+flutter:
+  uses-material-design: true

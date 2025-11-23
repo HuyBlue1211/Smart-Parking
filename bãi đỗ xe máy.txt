@@ -1,0 +1,1328 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Parking GUI (Pi)
+- IR vào/ra: delay 0.5s mới chụp (nhấn nút chụp thì chụp ngay)
+- Đồng bộ Firestore:
+  + parking_slots/S1..S5: occupied (như cũ) + reserved (dựa trên reservations 'booked' đang hiệu lực)
+  + reservations: tự mở barie IN nếu có đặt chỗ hợp lệ (đồng thời mark 'used')
+- Giao diện giữ nguyên bố cục nửa trái/nửa phải (cam/ảnh/biển + thông tin/slot)
+"""
+
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "2")
+os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
+
+import cv2
+try:
+    cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+except Exception:
+    pass
+
+import re, time, json, threading, serial, serial.tools.list_ports
+from pathlib import Path
+import numpy as np
+import tkinter as tk
+from tkinter import Label, Entry, Button, Frame, messagebox
+from PIL import Image, ImageTk
+from picamera2 import Picamera2
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+
+# ====================== FIRESTORE ADMIN ======================
+SERVICE_ACCOUNT_JSON = "/home/pi/serviceAccount.json"  # <-- ĐỔI CHO ĐÚNG
+PROJECT_ID = None
+USE_FIRESTORE = True
+FS = None
+fs_mod = None
+
+if USE_FIRESTORE:
+    try:
+        import firebase_admin
+        from firebase_admin import credentials, firestore
+        fs_mod = firestore
+        _cred = credentials.Certificate(SERVICE_ACCOUNT_JSON)
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app(_cred, {'projectId': PROJECT_ID} if PROJECT_ID else None)
+        FS = firestore.client()
+        print("[FIRESTORE] Admin SDK ready")
+    except Exception as e:
+        print("[FIRESTORE] Init failed:", e)
+        USE_FIRESTORE = False
+        FS = None
+        fs_mod = None
+
+# Lưu docPath Firestore cho mỗi UID (ESP-IN trả về sau khi tạo phiên)
+session_path_by_uid = {}  # uid -> "parking_sessions/<docId>"
+
+# ====================== CẤU HÌNH ======================
+MODEL_PATH   = "/home/pi/Downloads/detect/license-plate-finetune-v1n.onnx"
+DET_IMGSZ    = 256
+DET_CONF     = 0.25
+
+CAM_W, CAM_H   = 320, 220
+USB_RES        = (1280, 720)
+CSI_PREVIEW    = (1280, 720)
+SNAP_W, SNAP_H = 300, 180
+
+SER_BAUD            = 115200
+SER_IN_CANDIDATES   = ["/dev/serial0", "/dev/ttyAMA0", "/dev/ttyS0"]
+SER_OUT_HINTS       = []
+IN_WRITE_TIMEOUT_MS = 6000
+
+# IR & SLOT
+USE_GPIO = True
+IR_IN_BEFORE_PIN  = 17
+IR_OUT_BEFORE_PIN = 23
+IR_IN_AFTER_PIN   = 22
+IR_OUT_AFTER_PIN  = 27
+IR_ACTIVE_LOW = True
+IR_DEBOUNCE_MS = 200
+IR_MIN_INTERVAL_MS = 2500
+IR_SNAPSHOT_DELAY_MS = 500     # <— Delay 0.5s sau khi IR kích thì mới chụp
+last_ir_ms = {"in_before": 0, "out_before": 0, "in_after": 0, "out_after": 0}
+
+SLOT_PINS = [5, 6, 16, 20, 21]
+SLOT_NAMES = ["Vị trí 1", "Vị trí 2", "Vị trí 3", "Vị trí 4", "Vị trí 5"]
+SLOT_ACTIVE_LOW = True
+SLOT_DEBOUNCE_MS = 150
+SLOT_MIN_INTERVAL_MS = 1200
+last_slot_ms = {}
+slot_status = []  # bool list (occupied)
+slot_reserved_now = [False]*5  # reserved theo reservations đang hiệu lực
+slot_reserved_until = [None]*5 # thời điểm kết thúc reservation hiện hành (để hiển thị)
+
+# DocID cho collection parking_slots (khớp với App: "S1".."S5")
+def slot_doc_id(idx):  # 0..4
+    return f"S{idx+1}"
+
+# ====================== GIÁ NGÀY/ĐÊM ======================
+CONFIG_PATH = str(Path(CONFIG_PATH := Path.home() / ".parking_gui_config.json"))
+PRICE_DAY_DEFAULT   = 2000
+PRICE_NIGHT_DEFAULT = 2500
+price_day   = PRICE_DAY_DEFAULT
+price_night = PRICE_NIGHT_DEFAULT
+
+APP_VERSION = "pi-1.6-fs-reserve-ir-delay"
+
+def dbg(msg: str): print(f"[DBG {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+
+def load_config():
+    global price_day, price_night
+    try:
+        if Path(CONFIG_PATH).exists():
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            price_day   = int(cfg.get("price_day", PRICE_DAY_DEFAULT))
+            price_night = int(cfg.get("price_night", PRICE_NIGHT_DEFAULT))
+            dbg(f"CONFIG loaded: day={price_day}, night={price_night}")
+    except Exception as e:
+        dbg(f"CONFIG load error: {e}")
+
+def save_config():
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump({"price_day": price_day, "price_night": price_night}, f, ensure_ascii=False, indent=2)
+        dbg("CONFIG saved")
+    except Exception as e:
+        dbg(f"CONFIG save error: {e}")
+
+def is_daytime(dt=None):
+    dt = dt or datetime.now()
+    return 6 <= dt.hour <= 21
+
+def current_rate():        return price_day if is_daytime() else price_night
+def current_tariff_label():return "Ngày" if is_daytime() else "Đêm"
+
+# ====================== SERVO ======================
+SERVO_FREQ = 50
+SERVO_IN_PIN           = 18
+SERVO_IN_CLOSE_ANGLE   = 100
+SERVO_IN_OPEN_ANGLE    = 0
+SERVO_OUT_PIN          = 13
+SERVO_OUT_CLOSE_ANGLE  = 80
+SERVO_OUT_OPEN_ANGLE   = 180
+
+def angle_to_duty(angle_deg: float) -> float:
+    angle = max(0.0, min(180.0, float(angle_deg)))
+    return 2.5 + angle * (10.0/180.0)
+
+def _servo_pulse_angle(pwm, angle_deg: float, hold_ms: int = 700):
+    if not USE_GPIO or pwm is None:
+        dbg(f"Servo pulse skipped (USE_GPIO={USE_GPIO}, pwm={pwm}, angle={angle_deg})")
+        return
+    duty = angle_to_duty(angle_deg)
+    pwm.ChangeDutyCycle(duty)
+    root.after(hold_ms, lambda: pwm.ChangeDutyCycle(0))
+
+def _fs_set_gate(which: str, is_open: bool):
+    if not USE_FIRESTORE or FS is None or fs_mod is None: return
+    try:
+        FS.collection("gates").document(which).set({
+            "state": "OPEN" if is_open else "CLOSED",
+            "updatedAt": fs_mod.SERVER_TIMESTAMP
+        }, merge=True)
+    except Exception as e:
+        dbg(f"fs gate {which} error: {e}")
+
+def open_barie_in():  _servo_pulse_angle(servo_in_pwm,  SERVO_IN_OPEN_ANGLE); _fs_set_gate("in", True)
+def close_barie_in(): _servo_pulse_angle(servo_in_pwm,  SERVO_IN_CLOSE_ANGLE); _fs_set_gate("in", False)
+def open_barie_out(): _servo_pulse_angle(servo_out_pwm, SERVO_OUT_OPEN_ANGLE); _fs_set_gate("out", True)
+def close_barie_out():_servo_pulse_angle(servo_out_pwm, SERVO_OUT_CLOSE_ANGLE); _fs_set_gate("out", False)
+
+# ====================== TIME/IMG ======================
+def _now_ms(): return int(datetime.now().timestamp() * 1000)
+def now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def now_t14(): return datetime.now().strftime("%Y%m%d%H%M%S")
+
+def t14_to_dt(t14: str):
+    try: return datetime.strptime(t14, "%Y%m%d%H%M%S")
+    except: return None
+
+def set_entry_text(e: Entry, t: str):
+    st = e.cget("state")
+    if st == "readonly":
+        e.config(state="normal"); e.delete(0, tk.END); e.insert(0, t); e.config(state="readonly")
+    else:
+        e.delete(0, tk.END); e.insert(0, t)
+
+def show_image_on_label(lbl: Label, bgr):
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    img = Image.fromarray(rgb); imgtk = ImageTk.PhotoImage(image=img)
+    lbl.imgtk = imgtk; lbl.config(image=imgtk)
+
+def make_placeholder(w, h):
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    pil = Image.fromarray(rgb)
+    return ImageTk.PhotoImage(image=pil)
+
+# ====================== OCR HELPERS ======================
+VN_SERIES_LETTERS = "ABCDEFGHJKLMNPRSTUVWXYZ"
+VN_PROV_RE = re.compile(r"^\d{2}")
+
+def normalize_plate(s: str) -> str:
+    s = (s or "").strip().upper().replace(" ", "").replace("_", "")
+    s = ''.join(ch for ch in s if ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-.")
+    out=[]
+    for i,ch in enumerate(s):
+        prevd = i>0 and s[i-1].isdigit()
+        nextd = i+1<len(s) and s[i+1].isdigit()
+        if ch in ('O','D') and (prevd or nextd): ch='0'
+        elif ch in ('I','L') and (prevd or nextd): ch='1'
+        out.append(ch)
+    return ''.join(out)
+
+def parse_series_and_numbers(core: str):
+    if len(core) < 6: return None
+    if not VN_PROV_RE.match(core): return None
+    prov = core[:2]; rest = core[2:]
+    if not rest or not rest[0].isalpha(): return None
+    s1 = rest[0]
+    if s1 not in VN_SERIES_LETTERS: return None
+    series = s1; i = 1
+    if i < len(rest):
+        s2 = rest[i]
+        if s2.isalpha() and s2 in VN_SERIES_LETTERS: series += s2; i += 1
+        elif s2.isdigit():                           series += s2; i += 1
+    numbers = ''.join(ch for ch in rest[i:] if ch.isdigit())
+    if len(numbers) < 4: return None
+    if len(numbers) > 6: numbers = numbers[:6]
+    return prov, series, numbers
+
+def format_vn_plate(raw: str) -> str:
+    s = normalize_plate(raw)
+    core = s.replace("-", "").replace(".", "")
+    parsed = parse_series_and_numbers(core)
+    if not parsed: return ""
+    prov, series, numbers = parsed
+    if len(numbers) == 4: return f"{prov}{series}-{numbers}"
+    if len(numbers) == 5: return f"{prov}{series}-{numbers[:3]}.{numbers[3:]}"
+    return f"{prov}{series}-{numbers[:3]}.{numbers[3:6]}"
+
+def plate_key(s: str) -> str:
+    s = normalize_plate(s or "")
+    return s.replace("-", "").replace(".", "")
+
+# ====================== DETECTOR & OCR ======================
+detector = None
+detect_lock = threading.Lock()
+RAPID = None
+ocr_lock = threading.Lock()
+
+def rapid_text(res):
+    texts=[]
+    if not res: return ""
+    for item in res:
+        if isinstance(item, (list, tuple)):
+            if len(item) >= 2 and isinstance(item[1], str): texts.append(item[1])
+            elif len(item) >= 1 and isinstance(item[0], str): texts.append(item[0])
+        elif isinstance(item, str):
+            texts.append(item)
+    return "".join(texts).strip()
+
+def init_ocr():
+    global RAPID
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        RAPID = RapidOCR(); print("[OCR] RapidOCR OK")
+    except Exception as e:
+        print("[OCR] RapidOCR not available:", e); RAPID=None
+
+def init_detector():
+    global detector
+    try:
+        from ultralytics import YOLO
+        if not Path(MODEL_PATH).exists():
+            print(f"[ERROR] Không tìm thấy model: {MODEL_PATH}")
+            return
+        detector = YOLO(MODEL_PATH)
+    except Exception as e:
+        print(f"[ERROR] Khởi tạo detector thất bại: {e}"); detector = None
+
+def warmup_detector():
+    if detector is None: return
+    dummy = np.zeros((DET_IMGSZ, DET_IMGSZ, 3), np.uint8)
+    with detect_lock:
+        detector.predict(dummy, imgsz=DET_IMGSZ, conf=0.1, verbose=False)
+
+def detect_best_bbox(img_bgr):
+    global detector
+    if detector is None: init_detector()
+    with detect_lock:
+        res = detector.predict(img_bgr, imgsz=DET_IMGSZ, conf=DET_CONF, verbose=False)
+    best=None
+    for r in res:
+        if r.boxes is None or r.boxes.xyxy is None: continue
+        xyxy = r.boxes.xyxy.cpu().numpy(); confs = r.boxes.conf.cpu().numpy()
+        for b,c in zip(xyxy, confs):
+            x1,y1,x2,y2 = map(float, b)
+            if best is None or c > best[-1]: best = (x1,y1,x2,y2,float(c))
+    return best
+
+def plate_rectify(crop_bgr):
+    g = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    g = cv2.GaussianBlur(g, (3,3), 0)
+    _, th = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+    if th.mean() < 127: th = 255 - th
+    cnts,_ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts: return crop_bgr
+    rect = cv2.minAreaRect(max(cnts, key=cv2.contourArea))
+    box  = cv2.boxPoints(rect).astype(np.float32)
+    w = int(rect[1][0]); h = int(rect[1][1])
+    if w < 1 or h < 1: return crop_bgr
+    if w < h: w, h = h, w
+    s = box.sum(axis=1); d = np.diff(box, axis=1).reshape(-1)
+    tl = box[np.argmin(s)]; br = box[np.argmax(s)]
+    tr = box[np.argmin(d)]; bl = box[np.argmax(d)]
+    src = np.array([tl,tr,br,bl], np.float32)
+    dst = np.array([[0,0],[w-1,0],[w-1,h-1],[0,h-1]], dtype=np.float32)
+    M = cv2.getPerspectiveTransform(src, dst)
+    rectified = cv2.warpPerspective(crop_bgr, M, (w, h))
+    pad = int(0.02 * min(w, h))
+    return rectified[pad:h-pad, pad:w-pad] if pad>1 else rectified
+
+def build_preprocess_variants(crop_bgr):
+    out = [("base", crop_bgr.copy())]
+    v1 = upscale_limit(crop_bgr, 900); v1 = clahe_bgr(v1); v1 = unsharp(v1)
+    out.append(("clahe_us", v1))
+    v2 = cv2.bilateralFilter(v1, 7, 50, 50); g2 = cv2.cvtColor(v2, cv2.COLOR_BGR2GRAY)
+    at = cv2.adaptiveThreshold(g2, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5)
+    out.append(("adaptive", cv2.cvtColor(at, cv2.COLOR_GRAY2BGR)))
+    g3 = cv2.cvtColor(v1, cv2.COLOR_BGR2GRAY)
+    _, otsu = cv2.threshold(g3, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+    k = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]], np.float32)
+    otsu2 = cv2.filter2D(otsu, -1, k)
+    out.append(("otsu_sharp", cv2.cvtColor(otsu2, cv2.COLOR_GRAY2BGR)))
+    se = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+    mc = cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, se, iterations=1)
+    out.append(("morph_close", cv2.cvtColor(mc, cv2.COLOR_GRAY2BGR)))
+    return out
+
+def is_blurry(img_bgr, thr: float = 120.0):
+    try:
+        g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        val = cv2.Laplacian(g, cv2.CV_64F).var()
+        return val < thr, float(val)
+    except Exception:
+        return False, 9999.0
+
+def clahe_bgr(img_bgr):
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
+    l2 = clahe.apply(l)
+    lab2 = cv2.merge((l2,a,b))
+    return cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
+
+def unsharp(img_bgr):
+    g = cv2.GaussianBlur(img_bgr, (0,0), sigmaX=1.2)
+    return cv2.addWeighted(img_bgr, 1.8, g, -0.8, 0)
+
+def upscale_limit(img_bgr, max_side=900):
+    h,w = img_bgr.shape[:2]
+    s = max(h,w)
+    if s >= max_side: return img_bgr
+    r = max_side / float(s)
+    return cv2.resize(img_bgr, (int(w*r), int(h*r)), interpolation=cv2.INTER_CUBIC)
+
+# ====================== CAMERA ======================
+latest_usb_full_bgr    = None
+latest_csi_preview_bgr = None
+frame_lock = threading.Lock()
+stop_cams = threading.Event()
+
+def open_usb_camera(preferred=0, width=USB_RES[0], height=USB_RES[1], fps=30):
+    backends = [getattr(cv2, "CAP_V4L2", cv2.CAP_ANY), cv2.CAP_ANY]
+    for idx in [preferred, 1, 2, 3, 0]:
+        for be in backends:
+            cap = cv2.VideoCapture(idx, be)
+            if not cap.isOpened(): continue
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            cap.set(cv2.CAP_PROP_FPS, fps)
+            ret,_ = cap.read()
+            if ret:
+                print(f"[USB] OK index={idx}, backend={be}")
+                return cap
+            cap.release()
+    print("[USB] Không tìm thấy camera khả dụng"); return None
+
+def usb_capture_loop(cap):
+    global latest_usb_full_bgr
+    while not stop_cams.is_set():
+        try:
+            if cap is None or not cap.isOpened():
+                time.sleep(0.2); continue
+            ret, frame = cap.read()
+            if ret:
+                with frame_lock:
+                    latest_usb_full_bgr = frame
+        except Exception:
+            time.sleep(0.05)
+
+def csi_capture_loop(picam2):
+    global latest_csi_preview_bgr
+    while not stop_cams.is_set():
+        try:
+            rgb = picam2.capture_array()
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            with frame_lock:
+                latest_csi_preview_bgr = bgr
+        except Exception:
+            time.sleep(0.01)
+
+def ui_preview_tick():
+    try:
+        with frame_lock:
+            usb = latest_usb_full_bgr.copy() if latest_usb_full_bgr is not None else None
+            csi = latest_csi_preview_bgr.copy() if latest_csi_preview_bgr is not None else None
+        if usb is not None: show_image_on_label(lbl_cam_in,  cv2.resize(usb, (CAM_W, CAM_H)))
+        if csi is not None: show_image_on_label(lbl_cam_out, cv2.resize(csi, (CAM_W, CAM_H)))
+    except Exception:
+        pass
+    finally:
+        root.after(33, ui_preview_tick)
+
+# ====================== UI ======================
+root = tk.Tk()
+root.title("Parking")
+root.grid_columnconfigure(0, weight=1, uniform="half")
+root.grid_columnconfigure(1, weight=1, uniform="half")
+root.grid_rowconfigure(0, weight=1)
+
+# Left
+left = Frame(root)
+left.grid(row=0, column=0, sticky="nsew", padx=(8,4), pady=8)
+left.grid_columnconfigure(0, weight=1)
+left.grid_columnconfigure(1, weight=1)
+left.grid_rowconfigure(0, weight=1)
+left.grid_rowconfigure(1, weight=0)
+left.grid_rowconfigure(2, weight=0)
+
+f_prev_in  = Frame(left, relief="sunken", bd=1)
+f_prev_out = Frame(left, relief="sunken", bd=1)
+f_prev_in.grid(row=0, column=0, padx=4, pady=4, sticky="nsew")
+f_prev_out.grid(row=0, column=1, padx=4, pady=4, sticky="nsew")
+for f in (f_prev_in, f_prev_out):
+    f.grid_columnconfigure(0, weight=1); f.grid_rowconfigure(0, weight=1)
+lbl_cam_in  = Label(f_prev_in);  lbl_cam_in.grid(row=0, column=0, sticky="nsew")
+lbl_cam_out = Label(f_prev_out); lbl_cam_out.grid(row=0, column=0, sticky="nsew")
+lbl_cam_in.imgtk  = make_placeholder(CAM_W, CAM_H);  lbl_cam_in.config(image=lbl_cam_in.imgtk)
+lbl_cam_out.imgtk = make_placeholder(CAM_W, CAM_H); lbl_cam_out.config(image=lbl_cam_out.imgtk)
+
+f_snap_in  = Frame(left, relief="sunken", bd=1)
+f_snap_out = Frame(left, relief="sunken", bd=1)
+f_snap_in.grid(row=1, column=0, padx=4, pady=(2,6), sticky="n")
+f_snap_out.grid(row=1, column=1, padx=4, pady=(2,6), sticky="n")
+Label(f_snap_in,  text="Ảnh vào").pack()
+Label(f_snap_out, text="Ảnh ra").pack()
+lbl_snap_in  = Label(f_snap_in);  lbl_snap_in.pack()
+lbl_snap_out = Label(f_snap_out); lbl_snap_out.pack()
+lbl_snap_in.imgtk  = make_placeholder(SNAP_W, SNAP_H);  lbl_snap_in.config(image=lbl_snap_in.imgtk)
+lbl_snap_out.imgtk = make_placeholder(SNAP_W, SNAP_H); lbl_snap_out.config(image=lbl_snap_out.imgtk)
+
+row_in = Frame(left); row_in.grid(row=2, column=0, padx=4, pady=(0,2), sticky="ew")
+row_out = Frame(left); row_out.grid(row=2, column=1, padx=4, pady=(0,2), sticky="ew")
+row_in.grid_columnconfigure(1, weight=1)
+row_out.grid_columnconfigure(1, weight=1)
+Label(row_in, text="Biển vào:").grid(row=0, column=0, sticky="w")
+Label(row_out, text="Biển ra:").grid(row=0, column=0, sticky="w")
+entry_bien_in  = Entry(row_in, width=18, justify="center"); entry_bien_in.grid(row=0, column=1, sticky="ew", padx=(4,4))
+entry_bien_out = Entry(row_out, width=18, justify="center"); entry_bien_out.grid(row=0, column=1, sticky="ew", padx=(4,4))
+btn_in = Button(row_in, text="Chụp"); btn_in.grid(row=0, column=2, sticky="e")
+btn_out = Button(row_out, text="Chụp"); btn_out.grid(row=0, column=2, sticky="e")
+
+# Right
+right = Frame(root)
+right.grid(row=0, column=1, sticky="nsew", padx=(4,8), pady=8)
+right.grid_columnconfigure(0, weight=1)
+right.grid_rowconfigure(0, weight=0)
+right.grid_rowconfigure(1, weight=0)
+right.grid_rowconfigure(2, weight=1)
+
+def open_settings():
+    global price_day, price_night
+    win = tk.Toplevel(root); win.title("Cài đặt giá (ngày/đêm)"); win.grab_set()
+    frm = Frame(win, padx=12, pady=12); frm.pack(fill="both", expand=True)
+    Label(frm, text="Giá ban ngày (đ/giây):").grid(row=0, column=0, sticky="w", pady=4)
+    e_day = Entry(frm, width=14, justify="center"); e_day.grid(row=0, column=1, sticky="w", pady=4); e_day.insert(0, str(price_day))
+    Label(frm, text="Giá ban đêm (đ/giây):").grid(row=1, column=0, sticky="w", pady=4)
+    e_night = Entry(frm, width=14, justify="center"); e_night.grid(row=1, column=1, sticky="w", pady=4); e_night.insert(0, str(price_night))
+    def do_save():
+        try:
+            d = int(''.join(ch for ch in e_day.get() if ch.isdigit()))
+            n = int(''.join(ch for ch in e_night.get() if ch.isdigit()))
+            if d <= 0 or n <= 0: raise ValueError
+            globals()['price_day'] = d; globals()['price_night'] = n
+            save_config()
+            set_entry_text(entry_rate, str(current_rate()))
+            lbl_tariff.config(text=f"Khung giá hiện hành: {current_tariff_label()}")
+            win.destroy()
+        except Exception:
+            messagebox.showerror("Lỗi", "Giá phải là số dương (đ/giây)")
+    Button(frm, text="Save", command=do_save).grid(row=2, column=0, columnspan=2, pady=(10,0))
+Button(right, text="⚙️", width=3, command=open_settings).grid(row=0, column=0, sticky="ne")
+
+info = Frame(right)
+info.grid(row=0, column=0, sticky="nw", padx=(0,34), pady=(0,32))
+for c in range(4): info.grid_columnconfigure(c, weight=1)
+
+Label(info, text="Giờ vào:").grid(row=0, column=0, sticky="w")
+entry_gio_in = Entry(info, width=18, justify="center"); entry_gio_in.grid(row=0, column=1, sticky="ew", padx=(4,8))
+Label(info, text="Giờ ra:").grid(row=0, column=2, sticky="w")
+entry_gio_out = Entry(info, width=18, justify="center"); entry_gio_out.grid(row=0, column=3, sticky="ew")
+
+Label(info, text="Thời gian (giây):").grid(row=1, column=0, sticky="w", pady=(4,0))
+entry_time = Entry(info, width=15, state="readonly", justify="center"); entry_time.grid(row=1, column=1, sticky="ew", pady=(4,0))
+Label(info, text="").grid(row=1, column=2); Label(info, text="").grid(row=1, column=3)
+
+Label(info, text="Đơn giá (đ/giây):").grid(row=2, column=0, sticky="w", pady=(4,0))
+entry_rate = Entry(info, width=15, justify="center", state="readonly")
+entry_rate.grid(row=2, column=1, sticky="ew", pady=(4,0), padx=(4,8))
+Label(info, text="Phí thu (đ):").grid(row=2, column=2, sticky="w", pady=(4,0))
+entry_fee = Entry(info, width=15, state="readonly", justify="center")
+entry_fee.grid(row=2, column=3, sticky="ew", pady=(4,0), padx=(4,0))
+
+lbl_tariff = Label(info, text="Khung giá hiện hành: ?", fg="purple")
+lbl_tariff.grid(row=3, column=0, columnspan=4, sticky="w", pady=(6,0))
+
+rfid_row = Frame(right)
+rfid_row.grid(row=1, column=0, sticky="ew", pady=(8,6))
+rfid_row.grid_columnconfigure(0, weight=1)
+rfid_row.grid_columnconfigure(1, weight=1)
+
+rfid_in_box  = Frame(rfid_row, bd=1, relief="groove");  rfid_in_box.grid(row=0, column=0, sticky="ew", padx=(0,4))
+rfid_out_box = Frame(rfid_row, bd=1, relief="groove"); rfid_out_box.grid(row=0, column=1, sticky="ew", padx=(4,0))
+
+Label(rfid_in_box, text="RFID IN (UART)", font=("Arial",10,"bold")).grid(row=0, column=0, sticky="w", padx=8, pady=(4,0))
+lbl_rfid_in   = Label(rfid_in_box, text="Chưa kết nối", fg="red"); lbl_rfid_in.grid(row=1, column=0, sticky="w", padx=8)
+lbl_state_in  = Label(rfid_in_box, text="Trạng thái: chờ chụp/IR xe vào", wraplength=260, justify="left")
+lbl_state_in.grid(row=2, column=0, sticky="w", padx=8, pady=(0,6))
+
+Label(rfid_out_box, text="RFID OUT (USB)", font=("Arial",10,"bold")).grid(row=0, column=0, sticky="w", padx=8, pady=(4,0))
+lbl_rfid_out  = Label(rfid_out_box, text="Chưa kết nối", fg="red"); lbl_rfid_out.grid(row=1, column=0, sticky="w", padx=8)
+lbl_state_out = Label(rfid_out_box, text="Trạng thái: chờ chụp/IR xe ra", wraplength=260, justify="left")
+lbl_state_out.grid(row=2, column=0, sticky="w", padx=8, pady=(0,6))
+
+slots_frame = Frame(right, bd=1, relief="groove")
+slots_frame.grid(row=2, column=0, sticky="ew")
+Label(slots_frame, text="Trạng thái vị trí đỗ", font=("Arial",11,"bold")).grid(row=0, column=0, columnspan=3, sticky="w", padx=8, pady=(4,6))
+for c in range(3): slots_frame.grid_columnconfigure(c, weight=1)
+
+f1 = Frame(slots_frame, bd=1, relief="sunken", padx=4, pady=6); f1.grid(row=1, column=0, sticky="ew", padx=4, pady=4)
+f2 = Frame(slots_frame, bd=1, relief="sunken", padx=4, pady=6); f2.grid(row=1, column=1, sticky="ew", padx=4, pady=4)
+lbl1 = Label(f1, text=f"{SLOT_NAMES[0]}: Khởi tạo...", width=20, bg="#dddddd"); lbl1.pack()
+
+f3 = Frame(slots_frame, bd=1, relief="sunken", padx=4, pady=6); f3.grid(row=2, column=0, sticky="ew", padx=4, pady=4)
+f4 = Frame(slots_frame, bd=1, relief="sunken", padx=4, pady=6); f4.grid(row=2, column=1, sticky="ew", padx=4, pady=4)
+f5 = Frame(slots_frame, bd=1, relief="sunken", padx=4, pady=6); f5.grid(row=2, column=2, sticky="ew", padx=4, pady=4)
+lbl2 = Label(f2, text=f"{SLOT_NAMES[1]}: Khởi tạo...", width=20, bg="#dddddd"); lbl2.pack()
+lbl3 = Label(f3, text=f"{SLOT_NAMES[2]}: Khởi tạo...", width=20, bg="#dddddd"); lbl3.pack()
+lbl4 = Label(f4, text=f"{SLOT_NAMES[3]}: Khởi tạo...", width=20, bg="#dddddd"); lbl4.pack()
+lbl5 = Label(f5, text=f"{SLOT_NAMES[4]}: Khởi tạo...", width=20, bg="#dddddd"); lbl5.pack()
+
+slot_labels = [lbl1, lbl2, lbl3, lbl4, lbl5]
+
+# ====================== SERVO / GPIO ======================
+servo_in_pwm = None
+servo_out_pwm = None
+
+def _set_slot_ui(idx: int, occupied: bool, reserved: bool=False, reserved_until=None):
+    """Cập nhật nhãn slot theo occupied & reserved."""
+    if 0 <= idx < len(slot_labels):
+        if occupied:
+            txt = f"{SLOT_NAMES[idx]}: Đang đỗ"
+            bg  = "#ffcccc"
+        elif reserved:
+            # chỉ hiển thị “ĐÃ ĐẶT” (theo yêu cầu), không in biển hay giờ
+            txt = f"{SLOT_NAMES[idx]}: ĐÃ ĐẶT"
+            bg  = "#ffe4b5"  # cam nhạt
+        else:
+            txt = f"{SLOT_NAMES[idx]}: Trống"
+            bg  = "#ccffcc"
+        slot_labels[idx].config(text=txt, bg=bg)
+
+def _read_slot_level(idx: int):
+    try:
+        import RPi.GPIO as GPIO
+        level = GPIO.input(SLOT_PINS[idx])
+        return (level == GPIO.LOW) if SLOT_ACTIVE_LOW else (level == GPIO.HIGH)
+    except Exception:
+        return None
+
+# ====================== FIRESTORE SYNC HELPERS ======================
+def day_key_of_local(d: datetime) -> str:
+    return f"{d.year:04d}-{d.month:02d}-{d.day:02d}"
+
+def _fs_update_slot(idx: int, occupied: bool, reserved: bool=None):
+    """Đẩy occupied (+optional reserved) lên parking_slots/S# để App đọc (nếu muốn)."""
+    if not USE_FIRESTORE or FS is None or fs_mod is None: return
+    try:
+        data = {
+            "index": idx+1,
+            "name": SLOT_NAMES[idx],
+            "occupied": bool(occupied),
+            "updatedAt": fs_mod.SERVER_TIMESTAMP
+        }
+        if reserved is not None:
+            data["reserved"] = bool(reserved)
+        FS.collection("parking_slots").document(slot_doc_id(idx)).set(data, merge=True)
+    except Exception as e:
+        dbg(f"_fs_update_slot error: {e}")
+
+def _fs_update_lot_summary():
+    if not USE_FIRESTORE or FS is None or fs_mod is None or not slot_status: return
+    try:
+        total = len(slot_status)
+        occ   = sum(1 for s in slot_status if s)
+        free  = total - occ
+        FS.collection("lot_status").document("main").set({
+            "total": total, "occupied": occ, "free": free,
+            "updatedAt": fs_mod.SERVER_TIMESTAMP
+        }, merge=True)
+    except Exception as e:
+        dbg(f"fs_update_lot_summary error: {e}")
+
+def _fs_heartbeat_loop():
+    if not USE_FIRESTORE or FS is None or fs_mod is None: return
+    while True:
+        try:
+            FS.collection("devices").document("pi").set({
+                "lastSeen": fs_mod.SERVER_TIMESTAMP,
+                "version": APP_VERSION
+            }, merge=True)
+        except Exception as e:
+            dbg(f"heartbeat error: {e}")
+        time.sleep(15)
+
+# ----- Reservations overlay -----
+_last_reserved_state = [None]*5  # để tránh ghi lại liên tục vào parking_slots
+
+def _refresh_reservations_and_update_ui():
+    """Đọc reservations 'booked' trong ngày & cập nhật reserved overlay + (tuỳ chọn) push reserved lên parking_slots."""
+    try:
+        if not USE_FIRESTORE or FS is None: 
+            # vẫn update UI từ biến local nếu có
+            for i in range(5):
+                _set_slot_ui(i, slot_status[i] if i < len(slot_status) else False,
+                             reserved=(slot_reserved_now[i] if i<len(slot_reserved_now) else False))
+            return
+        # Query theo dayKey + status (lọc thời gian ở client tránh cần index phức tạp)
+        dk = day_key_of_local(datetime.now())
+        docs = list(FS.collection("reservations")
+                    .where("dayKey", "==", dk)
+                    .where("status", "==", "booked")
+                    .stream())
+        now_utc = datetime.now(timezone.utc)
+        # reset
+        for i in range(5):
+            slot_reserved_now[i] = False
+            slot_reserved_until[i] = None
+
+        for d in docs:
+            m = d.to_dict() or {}
+            sid = str(m.get("slotId") or "")
+            if sid.startswith("S") and sid[1:].isdigit():
+                idx = int(sid[1:]) - 1
+                if 0 <= idx < 5:
+                    start = m.get("start")
+                    end   = m.get("end")
+                    # start/end là datetime timezone-aware (UTC) do Firestore trả về
+                    if isinstance(start, datetime) and isinstance(end, datetime):
+                        if start <= now_utc <= end:
+                            slot_reserved_now[idx] = True
+                            slot_reserved_until[idx] = end
+
+        # Cập nhật UI + (tuỳ chọn) đẩy reserved lên parking_slots
+        for i in range(5):
+            occ = slot_status[i] if i < len(slot_status) else False
+            res = slot_reserved_now[i]
+            _set_slot_ui(i, occ, res, slot_reserved_until[i])
+
+            # nếu trạng thái reserved thay đổi so với lần trước thì cập nhật Firestore
+            if _last_reserved_state[i] != res:
+                _fs_update_slot(i, occ, reserved=res)
+                _last_reserved_state[i] = res
+
+    except Exception as e:
+        dbg(f"_refresh_reservations error: {e}")
+    finally:
+        root.after(6000, _refresh_reservations_and_update_ui)  # poll mỗi ~6s
+
+# ----- Tự mở barie IN nếu có reservation hợp lệ -----
+def find_valid_reservation_for_plate(plate_norm: str):
+    if not USE_FIRESTORE or FS is None: return (None, None)
+    try:
+        dk = day_key_of_local(datetime.now())
+        now_utc = datetime.now(timezone.utc)
+        # Query theo plateKey + dayKey + status, lọc thời gian ở client
+        q = (FS.collection("reservations")
+             .where("plateKey", "==", plate_norm)
+             .where("dayKey", "==", dk)
+             .where("status", "==", "booked")
+             .limit(10))
+        docs = list(q.stream())
+        for d in docs:
+            m = d.to_dict() or {}
+            start = m.get("start"); end = m.get("end")
+            if isinstance(start, datetime) and isinstance(end, datetime):
+                if start <= now_utc <= end:
+                    return (d.reference, m)
+        return (None, None)
+    except Exception as e:
+        dbg(f"find_valid_reservation_for_plate error: {e}")
+        return (None, None)
+
+def mark_reservation_used(doc_ref):
+    if not USE_FIRESTORE or FS is None or doc_ref is None: return False
+    try:
+        doc_ref.update({"status": "used", "usedAt": fs_mod.SERVER_TIMESTAMP})
+        return True
+    except Exception as e:
+        dbg(f"mark_reservation_used error: {e}")
+        return False
+
+def auto_open_in_if_reserved(plate_text: str):
+    if not plate_text: return False
+    key = plate_key(plate_text)
+    ref, _data = find_valid_reservation_for_plate(key)
+    if not ref: return False
+    ok = mark_reservation_used(ref)
+    if ok:
+        with in_lock:
+            global in_barie_open, pending_in
+            in_barie_open = True
+            pending_in = None
+        set_entry_text(entry_gio_in, now_str())
+        open_barie_in()
+        lbl_state_in.config(text=f"Đặt chỗ hợp lệ — ĐÃ MỞ BARIE IN", fg="green")
+        return True
+    else:
+        lbl_state_in.config(text="Lỗi cập nhật reservation — dùng thẻ", fg="orange")
+        return False
+
+# ====================== SNAPSHOT & OCR FLOW ======================
+EXEC = ThreadPoolExecutor(max_workers=3)
+snapshot_busy = threading.Event()
+in_lock  = threading.RLock()
+out_lock = threading.RLock()
+
+pending_in      = None
+in_busy         = False
+in_await_remove = False
+in_hold_uid     = None
+in_current_uid  = None
+in_wd_timer_id  = None
+in_barie_open   = False
+
+pending_out      = None
+out_wait_read    = False
+out_await_remove = False
+out_hold_uid     = None
+out_barie_open   = False
+
+def simple_ocr(crop_bgr):
+    rect = plate_rectify(crop_bgr)
+    was_blur, score = is_blurry(rect)
+    variants = [("rect", rect)] + build_preprocess_variants(rect)
+    if RAPID is not None:
+        for name, im in variants:
+            try:
+                with ocr_lock:
+                    res,_ = RAPID(im)
+                txt = rapid_text(res)
+                if txt:
+                    fmt = format_vn_plate(txt)
+                    if fmt:
+                        dbg(f"OCR OK via {name}, blur={score:.1f}")
+                        return fmt, was_blur
+            except Exception:
+                continue
+    dbg(f"OCR FAIL, blur={score:.1f}")
+    return "", was_blur
+
+def process_snapshot_async(kind: str, hi_bgr, snap_label, plate_entry, color):
+    if snapshot_busy.is_set(): return
+    snapshot_busy.set()
+
+    out_img = cv2.resize(hi_bgr, (SNAP_W, SNAP_H))
+    show_image_on_label(snap_label, out_img)
+    if kind=='in':
+        set_entry_text(entry_gio_in,  ""); btn_in.config(state="disabled", text="Đang xử lý…")
+    else:
+        set_entry_text(entry_gio_out, ""); btn_out.config(state="disabled", text="Đang xử lý…")
+
+    def worker():
+        try:
+            h, w = hi_bgr.shape[:2]
+            scale = DET_IMGSZ / max(h, w)
+            det_img = cv2.resize(hi_bgr, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
+            det = detect_best_bbox(det_img)
+
+            plate_text, was_blur = "", False
+            if det is not None:
+                x1,y1,x2,y2,conf = det
+                sx, sy = w / det_img.shape[1], h / det_img.shape[0]
+                X1, Y1, X2, Y2 = int(x1*sx), int(y1*sy), int(x2*sx), int(y2*sy)
+                X1=max(0,X1); Y1=max(0,Y1); X2=min(w-1,X2); Y2=min(h-1,Y2)
+                crop = hi_bgr[Y1:Y2, X1:X2]
+                if crop.size>0:
+                    pad = max(1, int(0.02*max(crop.shape[:2])))
+                    crop = cv2.copyMakeBorder(crop, pad,pad,pad,pad, cv2.BORDER_REPLICATE)
+                    plate_text, was_blur = simple_ocr(crop)
+                rsx, rsy = SNAP_W/w, SNAP_H/h
+                cv2.rectangle(out_img, (int(X1*rsx),int(Y1*rsy)), (int(X2*rsx),int(Y2*rsy)), color, 2)
+                if not plate_text and was_blur:
+                    cv2.putText(out_img, "Ảnh mờ — chụp lại", (10, SNAP_H-10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,0,255), 2)
+            else:
+                cv2.putText(out_img, "Không thấy biển", (10, 22),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,0,255), 2)
+
+            def ui_update():
+                show_image_on_label(snap_label, out_img)
+                set_entry_text(plate_entry, plate_text)
+
+                if kind == 'in':
+                    fmt = plate_text or ""
+                    raw = normalize_plate(fmt) if fmt else "NA"
+                    with in_lock:
+                        global pending_in
+                        pending_in = {"raw":raw, "fmt":fmt if fmt else raw, "t14":None, "t_disp":None, "has_plate":bool(fmt)}
+                        lbl_state_in.config(
+                            text=("Sẵn sàng ghi thẻ (IN)" if fmt else "KHÔNG PHÁT HIỆN BIỂN — KHÔNG GHI THẺ"),
+                            fg=("green" if fmt else "red")
+                        )
+                    # thử tự mở barie nếu có reservation hợp lệ
+                    if fmt:
+                        threading.Thread(target=lambda: auto_open_in_if_reserved(fmt), daemon=True).start()
+                else:
+                    fmt = plate_text or ""
+                    with out_lock:
+                        global pending_out, out_wait_read
+                        pending_out = {"fmt_ocr":fmt, "t_out_disp":None, "has_plate":bool(fmt)}
+                        out_wait_read = True
+                        lbl_state_out.config(
+                            text=("Sẵn sàng đọc thẻ (OUT)" if fmt else "KHÔNG PHÁT HIỆN BIỂN — KHÔNG ĐỌC THẺ"),
+                            fg=("green" if fmt else "red")
+                        )
+            root.after(0, ui_update)
+        finally:
+            def _done():
+                (btn_in if kind=='in' else btn_out).config(
+                    state="normal", text=("Chụp" if kind=='in' else "Chụp")
+                )
+                snapshot_busy.clear()
+            root.after(0, _done)
+    EXEC.submit(worker)
+
+def chup_vao():
+    with frame_lock:
+        src = latest_usb_full_bgr.copy() if latest_usb_full_bgr is not None else None
+    if src is None:
+        lbl_state_in.config(text="USB cam chưa sẵn sàng", fg="red"); return
+    process_snapshot_async('in', src, lbl_snap_in, entry_bien_in, (0,255,0))
+
+def chup_ra():
+    with frame_lock:
+        src = latest_csi_preview_bgr.copy() if latest_csi_preview_bgr is not None else None
+    if src is None:
+        lbl_state_out.config(text="CSI cam chưa sẵn sàng", fg="red"); return
+    process_snapshot_async('out', src, lbl_snap_out, entry_bien_out, (255,0,0))
+
+btn_in.config(command=chup_vao)
+btn_out.config(command=chup_ra)
+
+# ====================== IR CALLBACKS (delay 0.5s) ======================
+ir_lock = threading.Lock()
+def _ir_in_triggered(_ch):
+    with ir_lock:
+        ms=_now_ms()
+        if ms-last_ir_ms["in_before"]<IR_MIN_INTERVAL_MS: return
+        last_ir_ms["in_before"]=ms
+    root.after(IR_SNAPSHOT_DELAY_MS, chup_vao)   # <— delay 0.5s
+
+def _ir_out_triggered(_ch):
+    with ir_lock:
+        ms=_now_ms()
+        if ms-last_ir_ms["out_before"]<IR_MIN_INTERVAL_MS: return
+        last_ir_ms["out_before"]=ms
+    root.after(IR_SNAPSHOT_DELAY_MS, chup_ra)    # <— delay 0.5s
+
+def _ir_in_after_triggered(_ch):
+    global in_barie_open
+    with ir_lock:
+        ms=_now_ms()
+        if ms-last_ir_ms["in_after"]<IR_MIN_INTERVAL_MS: return
+        last_ir_ms["in_after"]=ms
+    with in_lock:
+        if in_barie_open:
+            close_barie_in()
+            in_barie_open=False
+            lbl_state_in.config(text="Xe IN đã qua — sẵn sàng lượt mới", fg="black")
+
+def _ir_out_after_triggered(_ch):
+    global out_barie_open
+    with ir_lock:
+        ms=_now_ms()
+        if ms-last_ir_ms["out_after"]<IR_MIN_INTERVAL_MS: return
+        last_ir_ms["out_after"]=ms
+    with out_lock:
+        if out_barie_open:
+            close_barie_out()
+            out_barie_open=False
+            lbl_state_out.config(text="Xe OUT đã qua — sẵn sàng lượt mới", fg="black")
+
+# ====================== SLOT GPIO ======================
+def _slot_changed(channel):
+    ms=_now_ms(); last=last_slot_ms.get(channel,0)
+    if ms-last<SLOT_MIN_INTERVAL_MS: return
+    last_slot_ms[channel]=ms
+    try:
+        import RPi.GPIO as GPIO
+        level = GPIO.input(channel)
+        occupied = (level==GPIO.LOW) if SLOT_ACTIVE_LOW else (level==GPIO.HIGH)
+        if channel in SLOT_PINS:
+            idx = SLOT_PINS.index(channel); slot_status[idx]=occupied
+            # cập nhật UI dùng reserved hiện tại
+            _set_slot_ui(idx, occupied, slot_reserved_now[idx], slot_reserved_until[idx])
+            _fs_update_slot(idx, occupied)  # push occupied
+            _fs_update_lot_summary()
+    except Exception as e:
+        dbg(f"_slot_changed error: {e}")
+
+def poll_slots():
+    if not USE_GPIO:
+        root.after(1000, poll_slots); return
+    try:
+        for i,_p in enumerate(SLOT_PINS):
+            occ = _read_slot_level(i)
+            if occ is None: continue
+            if i >= len(slot_status) or occ != slot_status[i]:
+                if i >= len(slot_status): slot_status.append(occ)
+                else: slot_status[i] = occ
+                _set_slot_ui(i, occ, slot_reserved_now[i], slot_reserved_until[i])
+                _fs_update_slot(i, occ)
+        _fs_update_lot_summary()
+    except Exception as e:
+        dbg(f"SLOT poll error: {e}")
+    root.after(700, poll_slots)
+
+def attach_gpio_callbacks():
+    if not USE_GPIO: return
+    try:
+        import RPi.GPIO as GPIO
+        pud = GPIO.PUD_UP if IR_ACTIVE_LOW else GPIO.PUD_DOWN
+        edge = GPIO.FALLING if IR_ACTIVE_LOW else GPIO.RISING
+        for p in (IR_IN_BEFORE_PIN, IR_OUT_BEFORE_PIN, IR_IN_AFTER_PIN, IR_OUT_AFTER_PIN):
+            GPIO.add_event_callback(p, _ir_in_triggered if p==IR_IN_BEFORE_PIN else
+                                       _ir_out_triggered if p==IR_OUT_BEFORE_PIN else
+                                       _ir_in_after_triggered if p==IR_IN_AFTER_PIN else
+                                       _ir_out_after_triggered)
+        for p in SLOT_PINS: GPIO.add_event_callback(p, _slot_changed)
+    except Exception as e:
+        print("[GPIO] callback error:", e)
+
+# ====================== TÍNH PHÍ & SERIAL (như cũ) ======================
+def set_calc_from_t14(t14_in: str):
+    t_in_dt = t14_to_dt(t14_in)
+    if not t_in_dt:
+        lbl_state_out.config(text="Không đọc được thời điểm vào từ thẻ", fg="orange"); return 0
+    t_out_dt = datetime.now()
+    seconds = int((t_out_dt - t_in_dt).total_seconds())
+    set_entry_text(entry_time, str(max(0, seconds)))
+    rate = current_rate()
+    set_entry_text(entry_rate, str(rate))
+    fee = max(0, seconds) * int(rate)
+    set_entry_text(entry_fee, str(fee))
+    lbl_tariff.config(text=f"Khung giá hiện hành: {current_tariff_label()}")
+    return seconds
+
+def send_in(line: str):
+    try:
+        if ser_in and ser_in.is_open: ser_in.write((line+"\n").encode()); print("[SER IN] ->", line)
+    except Exception as e:
+        lbl_rfid_in.config(text=f"RFID IN send lỗi: {e}", fg="red")
+
+def send_out(line: str):
+    try:
+        if ser_out and ser_out.is_open: ser_out.write((line+"\n").encode()); print("[SER OUT] ->", line)
+    except Exception as e:
+        lbl_rfid_out.config(text=f"RFID OUT send lỗi: {e}", fg="red")
+
+def open_serial_in():
+    global ser_in
+    for port in SER_IN_CANDIDATES:
+        try:
+            s = serial.Serial(port, SER_BAUD, timeout=0.2); ser_in = s
+            lbl_rfid_in.config(text=f"Kết nối {port}", fg="green")
+            threading.Thread(target=serial_reader_loop, args=(s,"IN"), daemon=True).start()
+            root.after(300, lambda: send_in("PING"))
+            return
+        except Exception as e:
+            print(f"[SER IN] open fail {port}:", e)
+    lbl_rfid_in.config(text="Chưa kết nối (sẽ thử lại...)", fg="red")
+    root.after(2000, open_serial_in)
+
+def open_serial_out():
+    global ser_out
+    ports = []
+    if SER_OUT_HINTS: ports.extend(SER_OUT_HINTS)
+    auto = [p.device for p in serial.tools.list_ports.comports() if ("USB" in p.device) or ("ACM" in p.device)]
+    ports.extend(auto); ports = list(dict.fromkeys(ports))
+    for port in ports:
+        try:
+            s = serial.Serial(port, SER_BAUD, timeout=0.2); ser_out = s
+            lbl_rfid_out.config(text=f"Kết nối {port}", fg="green")
+            threading.Thread(target=serial_reader_loop, args=(s,"OUT"), daemon=True).start()
+            root.after(300, lambda: send_out("WHO?"))
+            return
+        except Exception as e:
+            print(f"[SER OUT] open fail {port}:", e)
+    lbl_rfid_out.config(text="Chưa kết nối (sẽ thử lại...)", fg="red")
+    root.after(2000, open_serial_out)
+
+def serial_reader_loop(ser_handle, channel: str):
+    buf = b""
+    while True:
+        try:
+            if not ser_handle or not ser_handle.is_open: break
+            b = ser_handle.read(1)
+            if not b: continue
+            if b in b"\r\n":
+                if buf:
+                    line = buf.decode(errors="ignore").strip()
+                    if channel == "IN":  root.after(0, handle_line_in, line)
+                    else:                root.after(0, handle_line_out, line)
+                    buf = b""
+            else:
+                buf += b
+                if len(buf) > 512: buf = b""
+        except Exception as e:
+            try:
+                if channel == "IN":
+                    lbl_rfid_in.config(text=f"Mất kết nối ({e})", fg="red")
+                    if ser_in: ser_in.close(); root.after(1500, open_serial_in)
+                else:
+                    lbl_rfid_out.config(text=f"Mất kết nối ({e})", fg="red")
+                    if ser_out: ser_out.close(); root.after(1500, open_serial_out)
+            except: pass
+            break
+
+# Watchdog ghi IN
+in_wd_timer_id = None
+def in_cancel_watchdog():
+    global in_wd_timer_id
+    if in_wd_timer_id:
+        try: root.after_cancel(in_wd_timer_id)
+        except: pass
+        in_wd_timer_id = None
+
+def in_start_watchdog():
+    in_cancel_watchdog()
+    def wd():
+        global in_busy, in_current_uid, in_await_remove, in_hold_uid
+        with in_lock:
+            in_busy = False; in_current_uid=None; in_await_remove=False; in_hold_uid=None
+        lbl_state_in.config(text="Ghi thẻ TIMEOUT — vui lòng thử lại", fg="red")
+    globals()['in_wd_timer_id'] = root.after(IN_WRITE_TIMEOUT_MS, wd)
+
+# HANDLE IN
+def handle_line_in(line: str):
+    global in_busy, in_await_remove, in_hold_uid, in_current_uid, pending_in, in_barie_open
+    parts = line.split("|"); tag = parts[0].upper() if parts else ""
+
+    if line == "PONG":
+        lbl_rfid_in.config(text="ESP IN: PONG", fg="green"); return
+
+    if tag == "TRIG" and len(parts) >= 2:
+        if len(parts)>=3 and parts[1].upper()!="IN": return
+        uid = parts[2] if len(parts)>=3 else None
+        if not uid: return
+        with in_lock:
+            if in_await_remove and uid == in_hold_uid:
+                lbl_state_in.config(text=f"ĐÃ GHI UID {uid} — nhấc thẻ ra", fg="orange"); return
+            if in_barie_open:
+                lbl_state_in.config(text="Barie đang mở — chờ xe trước", fg="red")
+                send_in("ERR|BARIE_BUSY|IN"); send_in("BEEP|3"); return
+            if not pending_in or not pending_in.get("has_plate", False):
+                lbl_state_in.config(text="Chưa có biển hợp lệ — chụp lại", fg="red")
+                send_in("ERR|NOPLATE|IN"); send_in("BEEP|3"); return
+            if in_busy:
+                lbl_state_in.config(text=f"Đang ghi UID {in_current_uid} — đợi...", fg="blue"); return
+            in_busy = True; in_current_uid = uid
+            t14_now = now_t14(); disp_now = now_str()
+            pending_in["t14"]=t14_now; pending_in["t_disp"]=disp_now; raw = pending_in["raw"]
+        set_entry_text(entry_gio_in, disp_now)
+        lbl_state_in.config(text=f"Đang ghi UID {uid}...", fg="blue")
+        send_in(f"WR|IN|{raw}|{t14_now}"); in_start_watchdog(); return
+
+    if tag == "WR_OK" and len(parts)>=3 and parts[1].upper()=="IN":
+        uid = parts[2]; in_cancel_watchdog()
+        with in_lock:
+            plate_in = (pending_in["fmt"] or pending_in["raw"]) if pending_in else "NA"
+            in_busy=False; in_await_remove=True; in_hold_uid=uid; in_barie_open=True
+            pending_in=None
+        open_barie_in()
+        lbl_state_in.config(text=f"ĐÃ GHI — nhấc thẻ (UID {uid})", fg="green")
+        send_in(f"FS|IN|{uid}|{plate_in}|IN-01")
+        send_in("BEEP|2")
+        return
+
+    if tag == "FS_OK" and len(parts)>=4 and parts[1].upper()=="IN":
+        uid  = parts[2]
+        path = parts[3]  # "parking_sessions/<docId>"
+        session_path_by_uid[uid] = path
+        dbg(f"Firestore IN ok: {uid} -> {path}")
+        return
+
+    if (tag in ("OFF","CARD_OFF")) and len(parts)>=3 and parts[1].upper()=="IN":
+        uid = parts[2]
+        with in_lock:
+            if in_await_remove and uid == in_hold_uid:
+                in_await_remove=False; in_hold_uid=None; in_current_uid=None
+                lbl_state_in.config(text="Thẻ đã nhấc — sẵn sàng", fg="black")
+        return
+
+    if tag == "ERR" and len(parts)>=2 and parts[1].startswith("WR"):
+        in_cancel_watchdog()
+        with in_lock: in_busy=False
+        lbl_state_in.config(text=f"LỖI GHI: {'|'.join(parts)}", fg="red"); return
+
+# HANDLE OUT (giữ nguyên logic đối chiếu)
+def do_out_compare_and_fee(fmt_ocr: str, plate_card: str, t14_in: str) -> bool:
+    try:
+        fmt_card = format_vn_plate(plate_card) or normalize_plate(plate_card) or plate_card
+        key_ocr  = plate_key(fmt_ocr)
+        key_card = plate_key(fmt_card)
+        _ = set_calc_from_t14(t14_in)
+        ok = (key_ocr and key_card and key_ocr == key_card)
+        lbl_state_out.config(text=("ĐỐI CHIẾU KHỚP — THU TIỀN" if ok else "KHÔNG KHỚP — CẢNH BÁO"),
+                             fg=("green" if ok else "red"))
+        return ok
+    except Exception:
+        lbl_state_out.config(text="Lỗi tính/đối chiếu", fg="red"); return False
+
+def handle_line_out(line: str):
+    global out_wait_read, out_await_remove, out_hold_uid, pending_out, out_barie_open
+    parts=line.split("|"); tag=parts[0].upper() if parts else ""
+    try:
+        if line.startswith("HELLO|OUT"):
+            lbl_rfid_out.config(text="ESP OUT: HELLO", fg="green"); return
+
+        if tag == "TRIG":
+            uid = parts[2] if (len(parts)>=3 and parts[1].upper()=="OUT") else (parts[1] if len(parts)>=2 else None)
+            if not uid: return
+            with out_lock:
+                if out_await_remove and uid == out_hold_uid:
+                    lbl_state_out.config(text=f"Đã đọc (UID {uid}) — nhấc thẻ", fg="orange"); return
+                if not pending_out or not pending_out.get("has_plate", False):
+                    lbl_state_out.config(text="Chưa có ảnh OCR hợp lệ — chụp xe ra", fg="red")
+                    send_out("ERR|NOPLATE|OUT"); send_out("BEEP|3"); return
+                lbl_state_out.config(text=f"Đang đọc UID {uid}...", fg="blue")
+            return
+
+        if tag == "RD_OK":
+            if len(parts)>=5 and parts[1].upper()=="OUT":
+                uid, plate_card, t14_in = parts[2], parts[3], parts[4]
+            elif len(parts)>=4:
+                uid, plate_card, t14_in = parts[1], parts[2], parts[3]
+            else:
+                lbl_state_out.config(text="RD_OK thiếu dữ liệu", fg="red"); return
+
+            with out_lock:
+                if not pending_out:
+                    lbl_state_out.config(text="Nhận RD_OK nhưng chưa có ảnh OCR — chụp xe ra", fg="orange"); return
+                fmt_ocr = pending_out["fmt_ocr"] or ""
+                out_wait_read=False; out_await_remove=True; out_hold_uid=uid
+
+            set_entry_text(entry_gio_out, now_str())
+            matched = do_out_compare_and_fee(fmt_ocr, plate_card, t14_in)
+
+            if matched:
+                with out_lock:
+                    need_open = not out_barie_open
+                    if need_open: out_barie_open = True
+                if need_open: open_barie_out()
+                send_out(f"CLR|OUT|{uid}")
+                lbl_state_out.config(text=f"KHỚP — đã thu tiền — đang xóa thẻ (UID {uid})", fg="green")
+
+                seconds = int(entry_time.get() or "0")
+                fee     = int(entry_fee.get()  or "0")
+                path    = session_path_by_uid.get(uid, "")
+                send_out(f"FS|OUT|{uid}|{path}|OUT-01|{seconds}|{fee}")
+            else:
+                lbl_state_out.config(text=f"KHÔNG KHỚP — giữ nguyên thẻ (UID {uid})", fg="red")
+            return
+
+        if tag == "CLR_OK":
+            uid = parts[2] if (len(parts)>=3 and parts[1].upper()=="OUT") else (parts[1] if len(parts)>=2 else None)
+            if uid: lbl_state_out.config(text=f"ĐÃ XÓA THẺ (UID {uid}) — nhấc thẻ", fg="green"); send_out("BEEP|2")
+            return
+
+        if tag == "FS_OK" and len(parts)>=3 and parts[1].upper()=="OUT":
+            uid = parts[2]; dbg(f"Firestore OUT ok: {uid}"); return
+        if tag == "FS_ERR":
+            dbg("Firestore error: " + "|".join(parts)); return
+
+        if (tag in ("OFF","CARD_OFF")):
+            uid = parts[2] if (len(parts)>=3 and parts[1].upper()=="OUT") else (parts[1] if len(parts)>=2 else None)
+            if not uid: return
+            with out_lock:
+                if out_await_remove and uid == out_hold_uid:
+                    out_await_remove=False; out_hold_uid=None; pending_out=None
+                    lbl_state_out.config(text="Thẻ đã nhấc — sẵn sàng", fg="black")
+            return
+
+        if tag == "ERR" and len(parts)>=2 and (parts[1].startswith("RD") or parts[1].startswith("CLR")):
+            lbl_state_out.config(text=f"LỖI: {'|'.join(parts)}", fg="red"); return
+
+    except Exception as e:
+        lbl_state_out.config(text=f"Lỗi OUT: {e}", fg="red")
+
+# ====================== SERIAL OPEN & GPIO INIT ======================
+ser_in, ser_out = None, None
+
+# GPIO init
+try:
+    import RPi.GPIO as GPIO
+    GPIO.setmode(GPIO.BCM)
+    pud = GPIO.PUD_UP if IR_ACTIVE_LOW else GPIO.PUD_DOWN
+    edge = GPIO.FALLING if IR_ACTIVE_LOW else GPIO.RISING
+    for p in (IR_IN_BEFORE_PIN, IR_OUT_BEFORE_PIN, IR_IN_AFTER_PIN, IR_OUT_AFTER_PIN):
+        GPIO.setup(p, GPIO.IN, pull_up_down=pud)
+        GPIO.add_event_detect(p, edge, bouncetime=IR_DEBOUNCE_MS)
+
+    GPIO.setup(SERVO_IN_PIN,  GPIO.OUT)
+    GPIO.setup(SERVO_OUT_PIN, GPIO.OUT)
+    servo_in_pwm  = GPIO.PWM(SERVO_IN_PIN,  SERVO_FREQ); servo_in_pwm.start(0)
+    servo_out_pwm = GPIO.PWM(SERVO_OUT_PIN, SERVO_FREQ); servo_out_pwm.start(0)
+
+    slot_status = [False]*len(SLOT_PINS)
+    for p in SLOT_PINS:
+        GPIO.setup(p, GPIO.IN, pull_up_down=(GPIO.PUD_UP if SLOT_ACTIVE_LOW else GPIO.PUD_DOWN))
+        GPIO.add_event_detect(p, GPIO.BOTH, bouncetime=SLOT_DEBOUNCE_MS)
+        last_slot_ms[p] = 0
+
+    print("[GPIO] ready")
+except Exception as e:
+    USE_GPIO = False
+    print("[GPIO] disabled:", e)
+    servo_in_pwm = None
+    servo_out_pwm = None
+
+# ====================== CAMERA + ML START ======================
+def init_all_ml():
+    init_ocr(); init_detector(); warmup_detector()
+
+load_config()
+picam2 = Picamera2()
+picam2.configure(picam2.create_preview_configuration(main={"size": CSI_PREVIEW}))
+picam2.start()
+threading.Thread(target=csi_capture_loop, args=(picam2,), daemon=True).start()
+
+cap_usb = open_usb_camera(preferred=0, width=USB_RES[0], height=USB_RES[1], fps=30)
+if cap_usb is not None:
+    threading.Thread(target=usb_capture_loop, args=(cap_usb,), daemon=True).start()
+else:
+    print("[USB] Không mở được USB cam")
+
+init_all_ml()
+root.after(50, ui_preview_tick)
+
+lbl_tariff.config(text=f"Khung giá hiện hành: {current_tariff_label()}")
+set_entry_text(entry_rate, str(current_rate()))
+
+# Bật serial & callbacks
+open_serial_in()
+open_serial_out()
+
+if USE_GPIO:
+    root.after(200, attach_gpio_callbacks)
+    root.after(700, poll_slots)
+    # servo về đóng + ghi trạng thái gate
+    root.after(300, lambda: (_servo_pulse_angle(servo_in_pwm,  SERVO_IN_CLOSE_ANGLE, 700), _fs_set_gate("in", False)))
+    root.after(350, lambda: (_servo_pulse_angle(servo_out_pwm, SERVO_OUT_CLOSE_ANGLE, 700), _fs_set_gate("out", False)))
+else:
+    for i in range(len(SLOT_PINS)):
+        if i < len(slot_labels):
+            slot_labels[i].config(text=f"{SLOT_NAMES[i]}: Không khả dụng", bg="#dddddd")
+
+# Heartbeat & reservation overlay poll
+if USE_FIRESTORE and FS is not None and fs_mod is not None:
+    threading.Thread(target=_fs_heartbeat_loop, daemon=True).start()
+root.after(1200, _refresh_reservations_and_update_ui)
+
+# ====================== ĐÓNG APP ======================
+def on_closing():
+    try: EXEC.shutdown(wait=False, cancel_futures=True)
+    except: pass
+    try: stop_cams.set()
+    except: pass
+    try:
+        if cap_usb: cap_usb.release()
+    except: pass
+    try: picam2.stop()
+    except: pass
+    try:
+        if ser_in: ser_in.close()
+    except: pass
+    try:
+        if ser_out: ser_out.close()
+    except: pass
+    try:
+        if USE_GPIO:
+            if servo_in_pwm:  servo_in_pwm.ChangeDutyCycle(0);  servo_in_pwm.stop()
+            if servo_out_pwm: servo_out_pwm.ChangeDutyCycle(0); servo_out_pwm.stop()
+            import RPi.GPIO as GPIO; GPIO.cleanup()
+    except: pass
+    root.destroy()
+
+root.protocol("WM_DELETE_WINDOW", on_closing)
+root.minsize(2*CAM_W + 260, CAM_H + SNAP_H + 220)
+root.mainloop()
